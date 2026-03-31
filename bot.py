@@ -6,6 +6,7 @@ import os
 from dotenv import load_dotenv
 import yt_dlp
 
+# ---------- ENV ----------
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -13,6 +14,7 @@ ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
 NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID", 0))
 
+# ---------- DISCORD ----------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -24,10 +26,12 @@ is_playing_news = False
 # ---------- ELEVENLABS ----------
 async def generate_tts(text, filename="news.mp3"):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+
     headers = {
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json"
     }
+
     data = {
         "text": text,
         "voice_settings": {
@@ -39,18 +43,21 @@ async def generate_tts(text, filename="news.mp3"):
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=data, headers=headers) as response:
             if response.status != 200:
-                print("ElevenLabs error:", await response.text())
+                print("TTS ERROR:", await response.text())
                 return None
 
-            content = await response.read()
+            audio = await response.read()
+
             with open(filename, "wb") as f:
-                f.write(content)
+                f.write(audio)
+
             return filename
 
-# ---------- YOUTUBE STREAM ----------
+# ---------- YOUTUBE ----------
 ytdl_opts = {
-    "format": "bestaudio",
-    "quiet": True
+    "format": "bestaudio/best",
+    "quiet": True,
+    "noplaylist": False
 }
 
 ffmpeg_opts = {
@@ -59,11 +66,21 @@ ffmpeg_opts = {
 
 ytdl = yt_dlp.YoutubeDL(ytdl_opts)
 
-async def get_audio_source(url):
+
+async def extract_streams(url):
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-    stream_url = data["url"]
-    return discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
+
+    data = await loop.run_in_executor(
+        None, lambda: ytdl.extract_info(url, download=False)
+    )
+
+    # 🎵 PLAYLIST
+    if "entries" in data:
+        return [entry["url"] for entry in data["entries"] if entry]
+
+    # 🎵 SINGLE
+    return [data["url"]]
+
 
 # ---------- RADIO LOOP ----------
 async def radio_loop(vc):
@@ -71,12 +88,13 @@ async def radio_loop(vc):
 
     while True:
         try:
-            # 📰 NEWS PRIORITY
+            # 📰 NEWS FIRST
             if not news_queue.empty():
                 is_playing_news = True
-                text = await news_queue.get()
 
+                text = await news_queue.get()
                 file = await generate_tts(text)
+
                 if file:
                     vc.play(discord.FFmpegPCMAudio(file))
 
@@ -90,8 +108,17 @@ async def radio_loop(vc):
             if not vc.is_playing() and not is_playing_news:
                 if not music_queue.empty():
                     url = await music_queue.get()
-                    source = await get_audio_source(url)
-                    vc.play(source)
+                    streams = await extract_streams(url)
+
+                    for stream_url in streams:
+                        vc.play(discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts))
+
+                        while vc.is_playing():
+                            await asyncio.sleep(1)
+
+                        # If breaking news arrives → interrupt
+                        if not news_queue.empty():
+                            break
 
                 else:
                     await asyncio.sleep(2)
@@ -99,8 +126,9 @@ async def radio_loop(vc):
             await asyncio.sleep(1)
 
         except Exception as e:
-            print("RADIO LOOP ERROR:", e)
+            print("RADIO ERROR:", e)
             await asyncio.sleep(2)
+
 
 # ---------- COMMANDS ----------
 @bot.command()
@@ -120,10 +148,12 @@ async def join(ctx):
 
     await ctx.send("📻 De Antillen Radio LIVE!")
 
+
 @bot.command()
 async def play(ctx, url: str):
     await music_queue.put(url)
-    await ctx.send(f"🎵 Added to queue: {url}")
+    await ctx.send(f"🎵 Added: {url}")
+
 
 @bot.command()
 async def stop(ctx):
@@ -132,13 +162,12 @@ async def stop(ctx):
         vc.stop()
         await ctx.send("⏹️ Stopped")
 
-# ---------- MESSAGE LISTENER ----------
+
+# ---------- NEWS ----------
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-
-    print("MESSAGE:", message.content)
 
     await bot.process_commands(message)
 
@@ -151,6 +180,9 @@ async def on_message(message):
     if not vc:
         return
 
+    if "[IGNORE]" in content:
+        return
+
     if "[BREAKING]" in content:
         if vc.is_playing():
             vc.stop()
@@ -159,10 +191,12 @@ async def on_message(message):
     elif "[NORMAL]" in content:
         await news_queue.put(message.content)
 
+
 # ---------- READY ----------
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+
 
 # ---------- START ----------
 if not TOKEN:
