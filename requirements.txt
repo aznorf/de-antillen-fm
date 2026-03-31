@@ -1,3 +1,4 @@
-discord.py
-requests
+discord.py[voice]
+PyNaCl
 python-dotenv
+aiohttp
