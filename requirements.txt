@@ -2,3 +2,4 @@ discord.py[voice]
 PyNaCl
 python-dotenv
 aiohttp
+yt-dlp
