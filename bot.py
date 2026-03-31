@@ -40,7 +40,7 @@ async def generate_tts(text, filename="news.mp3"):
         async with session.post(url, json=data, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                print(f"Erreur ElevenLabs: {error_text}")
+                print(f"ElevenLabs error: {error_text}")
                 return None
             
             content = await response.read()
@@ -88,12 +88,25 @@ async def play_next(vc):
 # ---------- COMMANDES ----------
 @bot.command()
 async def join(ctx):
-    if ctx.author.voice:
-        channel = ctx.author.voice.channel
-        await channel.connect()
-        await ctx.send("✅ Radio De Antillen en ligne !")
-    else:
-        await ctx.send("Tu dois être dans un salon vocal.")
+    print("JOIN COMMAND TRIGGERED")
+
+    if not ctx.author.voice:
+        await ctx.send("❌ You need to be in a voice channel.")
+        return
+
+    channel = ctx.author.voice.channel
+
+    try:
+        if ctx.voice_client:
+            await ctx.voice_client.move_to(channel)
+        else:
+            await channel.connect()
+
+        await ctx.send("✅ De Antillen Radio online!")
+
+    except Exception as e:
+        print("JOIN ERROR:", e)
+        await ctx.send(f"Erreur: {e}")
 
 @bot.command()
 async def play(ctx, url: str):
@@ -101,25 +114,33 @@ async def play(ctx, url: str):
     vc = ctx.voice_client
     if vc and not vc.is_playing():
         await play_next(vc)
-    await ctx.send(f"Ajouté à la file : {url}")
+    await ctx.send(f"Added to the queue: {url}")
 
 @bot.command()
 async def stop(ctx):
     vc = ctx.voice_client
     if vc:
         vc.stop()
-        await ctx.send("Musique arrêtée.")
+        await ctx.send("Music stopped.")
 
 # ---------- LISTENER DE NEWS ----------
 @bot.event
 async def on_message(message):
-    # Important : ne pas oublier de traiter les commandes
+    if message.author.bot:
+        return
+
+    # 👉 DEBUG (VERY IMPORTANT)
+    print("MESSAGE RECEIVED:", message.content)
+
+    # ---------- COMMANDS FIRST ----------
     await bot.process_commands(message)
 
-    if message.channel.id != NEWS_CHANNEL_ID or message.author.bot:
+    # ---------- NEWS SYSTEM ----------
+    if message.channel.id != NEWS_CHANNEL_ID:
         return
 
     content = message.content.upper()
+
     if "[IGNORE]" in content:
         return
 
@@ -128,7 +149,6 @@ async def on_message(message):
         return
 
     if "[BREAKING]" in content:
-        # On coupe la musique immédiatement pour l'info urgente
         if vc.is_playing():
             vc.stop()
         await news_queue.put(message.content)
@@ -141,10 +161,10 @@ async def on_message(message):
 
 @bot.event
 async def on_ready():
-    print(f'Connecté en tant que {bot.user.name}')
+    print(f'Logged in as {bot.user.name}')
 
 # ---------- DEMARRAGE ----------
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("ERREUR : Le TOKEN est manquant. Vérifie tes variables d'environnement.")
+    print("ERROR : The TOKEN is missing. Check your environment variables.")
