@@ -4,8 +4,8 @@ import asyncio
 import aiohttp
 import os
 from dotenv import load_dotenv
+import yt_dlp
 
-# Chargement des variables d'environnement
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -21,7 +21,7 @@ music_queue = asyncio.Queue()
 news_queue = asyncio.Queue()
 is_playing_news = False
 
-# ---------- ELEVENLABS (Version Asynchrone) ----------
+# ---------- ELEVENLABS ----------
 async def generate_tts(text, filename="news.mp3"):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
     headers = {
@@ -39,110 +39,113 @@ async def generate_tts(text, filename="news.mp3"):
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=data, headers=headers) as response:
             if response.status != 200:
-                error_text = await response.text()
-                print(f"ElevenLabs error: {error_text}")
+                print("ElevenLabs error:", await response.text())
                 return None
-            
+
             content = await response.read()
             with open(filename, "wb") as f:
                 f.write(content)
             return filename
 
-# ---------- AUDIO ----------
-def play_audio(vc, file_path, after_callback):
-    # Sur Railway, ffmpeg doit être installé via apt.txt
-    source = discord.FFmpegPCMAudio(file_path)
-    vc.play(source, after=lambda e: bot.loop.create_task(after_callback(e)))
+# ---------- YOUTUBE STREAM ----------
+ytdl_opts = {
+    "format": "bestaudio",
+    "quiet": True
+}
 
-async def play_next(vc):
+ffmpeg_opts = {
+    "options": "-vn"
+}
+
+ytdl = yt_dlp.YoutubeDL(ytdl_opts)
+
+async def get_audio_source(url):
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+    stream_url = data["url"]
+    return discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
+
+# ---------- RADIO LOOP ----------
+async def radio_loop(vc):
     global is_playing_news
 
-    # Priorité aux infos (News)
-    if not news_queue.empty():
-        is_playing_news = True
-        text = await news_queue.get()
-        file = await generate_tts(text)
+    while True:
+        try:
+            # 📰 NEWS PRIORITY
+            if not news_queue.empty():
+                is_playing_news = True
+                text = await news_queue.get()
 
-        if not file:
-            is_playing_news = False
-            return
+                file = await generate_tts(text)
+                if file:
+                    vc.play(discord.FFmpegPCMAudio(file))
 
-        async def after_news(err):
-            global is_playing_news
-            is_playing_news = False
-            await play_next(vc)
+                    while vc.is_playing():
+                        await asyncio.sleep(1)
 
-        play_audio(vc, file, after_news)
-        return
+                is_playing_news = False
+                continue
 
-    # Sinon, on joue la musique
-    if not music_queue.empty():
-        is_playing_news = False
-        file = await music_queue.get()
+            # 🎵 MUSIC
+            if not vc.is_playing() and not is_playing_news:
+                if not music_queue.empty():
+                    url = await music_queue.get()
+                    source = await get_audio_source(url)
+                    vc.play(source)
 
-        async def after_music(err):
-            await play_next(vc)
+                else:
+                    await asyncio.sleep(2)
 
-        play_audio(vc, file, after_music)
+            await asyncio.sleep(1)
 
-# ---------- COMMANDES ----------
+        except Exception as e:
+            print("RADIO LOOP ERROR:", e)
+            await asyncio.sleep(2)
+
+# ---------- COMMANDS ----------
 @bot.command()
 async def join(ctx):
-    print("JOIN COMMAND TRIGGERED")
-
     if not ctx.author.voice:
-        await ctx.send("❌ You need to be in a voice channel.")
+        await ctx.send("❌ Join a voice channel first.")
         return
 
     channel = ctx.author.voice.channel
 
-    try:
-        if ctx.voice_client:
-            await ctx.voice_client.move_to(channel)
-        else:
-            await channel.connect()
+    if ctx.voice_client:
+        vc = await ctx.voice_client.move_to(channel)
+    else:
+        vc = await channel.connect()
 
-        await ctx.send("✅ De Antillen Radio online!")
+    bot.loop.create_task(radio_loop(vc))
 
-    except Exception as e:
-        print("JOIN ERROR:", e)
-        await ctx.send(f"Erreur: {e}")
+    await ctx.send("📻 De Antillen Radio LIVE!")
 
 @bot.command()
 async def play(ctx, url: str):
     await music_queue.put(url)
-    vc = ctx.voice_client
-    if vc and not vc.is_playing():
-        await play_next(vc)
-    await ctx.send(f"Added to the queue: {url}")
+    await ctx.send(f"🎵 Added to queue: {url}")
 
 @bot.command()
 async def stop(ctx):
     vc = ctx.voice_client
     if vc:
         vc.stop()
-        await ctx.send("Music stopped.")
+        await ctx.send("⏹️ Stopped")
 
-# ---------- LISTENER DE NEWS ----------
+# ---------- MESSAGE LISTENER ----------
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # 👉 DEBUG (VERY IMPORTANT)
-    print("MESSAGE RECEIVED:", message.content)
+    print("MESSAGE:", message.content)
 
-    # ---------- COMMANDS FIRST ----------
     await bot.process_commands(message)
 
-    # ---------- NEWS SYSTEM ----------
     if message.channel.id != NEWS_CHANNEL_ID:
         return
 
     content = message.content.upper()
-
-    if "[IGNORE]" in content:
-        return
 
     vc = discord.utils.get(bot.voice_clients, guild=message.guild)
     if not vc:
@@ -152,19 +155,17 @@ async def on_message(message):
         if vc.is_playing():
             vc.stop()
         await news_queue.put(message.content)
-        await play_next(vc)
 
     elif "[NORMAL]" in content:
         await news_queue.put(message.content)
-        if not vc.is_playing():
-            await play_next(vc)
 
+# ---------- READY ----------
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user.name}')
+    print(f"✅ Logged in as {bot.user}")
 
-# ---------- DEMARRAGE ----------
-if TOKEN:
-    bot.run(TOKEN)
-else:
-    print("ERROR : The TOKEN is missing. Check your environment variables.")
+# ---------- START ----------
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN missing")
+
+bot.run(TOKEN)
